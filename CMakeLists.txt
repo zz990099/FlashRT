@@ -47,6 +47,13 @@ else()
   set(ENABLE_SM100_CUTLASS OFF)
 endif()
 
+# Developer-only SM100 kernels. OFF by default so production flash_rt_kernels
+# neither compiles nor exports them; turn on locally for kernel bring-up.
+option(FLASHRT_BUILD_SM100_SWEEP
+       "Build the transient FP16 CUTLASS tile-sweep bench kernel" OFF)
+option(FLASHRT_BUILD_SM100_ENCODER_MLP
+       "Build the WIP Path C encoder MLP megakernel scaffold" OFF)
+
 # SM120+ (Blackwell): NVFP4/W4A8 block-scaled GEMM
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "120a")
   set(ENABLE_NVFP4 ON)
@@ -210,6 +217,134 @@ if(ENABLE_SM100_CUTLASS)
     >
   )
   message(STATUS "SM100 CUTLASS FP8 GEMMs: building for sm_${GPU_ARCH}")
+
+  # FP16 CUTLASS GEMMs (encoder/SigLIP FP16 path).
+  add_library(cutlass_sm100_fp16_obj OBJECT csrc/gemm/cutlass_sm100_fp16.cu)
+  set_target_properties(cutlass_sm100_fp16_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(cutlass_sm100_fp16_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(cutlass_sm100_fp16_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "SM100 CUTLASS FP16 GEMMs: building for sm_${GPU_ARCH}")
+
+  # Path C: vendored production sm100_gemm_tma_warpspecialized.hpp +
+  # single-GEMM instantiation for "match production" gate test.  The
+  # header is a literal copy of CUTLASS production; the .cu file
+  # instantiates it for the split-G7 shape via CollectiveBuilder.
+  add_library(flashrt_megakernel_obj OBJECT csrc/gemm/mega/flashrt_megakernel_single.cu)
+  set_target_properties(flashrt_megakernel_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(flashrt_megakernel_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  # Encoder GeGLU megakernel: fuses the gate and up GEMMs (one launch
+  # computes hidden = GELU(X @ W_gate) * (X @ W_up)).
+  add_library(flashrt_megakernel_geglu_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu.cu)
+  set_target_properties(flashrt_megakernel_geglu_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  # Include-path priority (mirrors libfmha_fp16_strided rules):
+  #   1. csrc/gemm/mega/  — vendored CUTLASS hooks under cutlass/pipeline,
+  #      cutlass/epilogue/collective, cutlass/gemm/collective. MUST be
+  #      before ${CUTLASS_INCLUDE} so the patched headers shadow the
+  #      stock CUTLASS versions only for this translation unit.
+  #   2. ${CUTLASS_INCLUDE} — upstream CUTLASS for everything else.
+  target_include_directories(flashrt_megakernel_geglu_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_geglu_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  # Encoder GeGLU + down-proj megakernel: bundles the GeGLU megakernel and
+  # the down GEMM (beta=1 residual) into one C entry.  Uses the same
+  # include precedence as the GeGLU object (mega dir before upstream CUTLASS).
+  add_library(flashrt_megakernel_geglu_g8_obj OBJECT csrc/gemm/mega/flashrt_megakernel_geglu_g8.cu)
+  set_target_properties(flashrt_megakernel_geglu_g8_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(flashrt_megakernel_geglu_g8_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/mega
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(flashrt_megakernel_geglu_g8_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+
+  # Path C encoder MLP megakernel scaffold (WIP, unused by the runtime).
+  if(FLASHRT_BUILD_SM100_ENCODER_MLP)
+    add_library(encoder_mlp_sm100_obj OBJECT csrc/gemm/mega/encoder_mlp_sm100.cu)
+    set_target_properties(encoder_mlp_sm100_obj PROPERTIES
+      CUDA_STANDARD 17
+      POSITION_INDEPENDENT_CODE ON
+    )
+    target_include_directories(encoder_mlp_sm100_obj PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+      ${CUTLASS_INCLUDE}
+      ${CUTLASS_DIR}/tools/util/include
+    )
+    target_compile_options(encoder_mlp_sm100_obj PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3 --use_fast_math
+        ${GPU_GENCODE}
+      >
+    )
+  endif()
+
+  # FP16 CUTLASS GEMM tile-sweep bench kernel (transient bring-up tool).
+  if(FLASHRT_BUILD_SM100_SWEEP)
+    add_library(cutlass_sm100_fp16_sweep_obj OBJECT csrc/gemm/cutlass_sm100_fp16_sweep.cu)
+    set_target_properties(cutlass_sm100_fp16_sweep_obj PROPERTIES
+      CUDA_STANDARD 17
+      POSITION_INDEPENDENT_CODE ON
+    )
+    target_include_directories(cutlass_sm100_fp16_sweep_obj PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+      ${CUTLASS_INCLUDE}
+      ${CUTLASS_DIR}/tools/util/include
+    )
+    target_compile_options(cutlass_sm100_fp16_sweep_obj PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3 --use_fast_math
+        ${GPU_GENCODE}
+      >
+    )
+  endif()
 endif()
 
 # ── libfmha_fp16_strided.so — CUTLASS SM100 FP16 FMHA for SigLIP ──
@@ -691,8 +826,21 @@ set_target_properties(flash_rt_kernels PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
 if(ENABLE_SM100_CUTLASS)
-  target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_obj>)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:cutlass_sm100_obj>
+    $<TARGET_OBJECTS:cutlass_sm100_fp16_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_geglu_obj>
+    $<TARGET_OBJECTS:flashrt_megakernel_geglu_g8_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
+  if(FLASHRT_BUILD_SM100_SWEEP)
+    target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_fp16_sweep_obj>)
+    target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_SM100_SWEEP=1)
+  endif()
+  if(FLASHRT_BUILD_SM100_ENCODER_MLP)
+    target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:encoder_mlp_sm100_obj>)
+    target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_SM100_ENCODER_MLP=1)
+  endif()
 endif()
 
 if(ENABLE_NVFP4)

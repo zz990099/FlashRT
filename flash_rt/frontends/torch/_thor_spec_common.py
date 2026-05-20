@@ -39,6 +39,11 @@ def paligemma_siglip_block(
     row-major layout (the ``T()`` transpose is kept so ``gemm.fp16_nn``
     can read them directly). ``Quant()`` is dropped and ``_sig_alpha``
     is not populated.
+
+    Tested 2026-05-18: dropping T() + switching to CUTLASS NT
+    (`cutlass_fp16_wide`) gives bit-exact output (cos=1.0) but no net
+    hot-regime win at Pi0.5 SigLIP shape (3-round mean 84.13 vs 83.87
+    cublas; within ±0.5 ms noise).  Kept cuBLAS to avoid layout risk.
     """
     qkv_tx  = [T(), Quant()]              if use_fp8 else [T()]
     o_tx    = [ToFp16(), T(), Quant()]    if use_fp8 else [ToFp16(), T()]
@@ -101,15 +106,16 @@ def paligemma_encoder_block(
       d    : ToFp16 → Quant
     Scales append to ``target._enc_w_scales`` in (q, o, gu, d) order.
 
-    When ``use_fp8=False``, ``Quant()`` is dropped and a ``T()``
-    transpose is added so weights land in ``[K, N]`` row-major (the
-    layout ``gemm.fp16_nn`` reads). FusedQKV / FusedGateUp natively
-    produce ``[N, K]``; ``T()`` flips them to the row-major NN layout.
+    When ``use_fp8=False``, both ``Quant()`` AND the ``T()`` transpose
+    are dropped — weights stay ``[N, K]`` row-major (the layout the
+    CUTLASS-FP16 NT GEMMs read, mirroring the FP8 NT convention).
+    FusedQKV / FusedGateUp natively produce ``[N, K]`` so no transform
+    is needed past ``ToFp16()`` for cast-only items.
     """
-    qkv_tx = [Quant()]            if use_fp8 else [T()]
-    o_tx   = [ToFp16(), Quant()]  if use_fp8 else [ToFp16(), T()]
-    gu_tx  = [Quant()]            if use_fp8 else [T()]
-    d_tx   = [ToFp16(), Quant()]  if use_fp8 else [ToFp16(), T()]
+    qkv_tx = [Quant()]            if use_fp8 else []
+    o_tx   = [ToFp16(), Quant()]  if use_fp8 else [ToFp16()]
+    gu_tx  = [Quant()]            if use_fp8 else []
+    d_tx   = [ToFp16(), Quant()]  if use_fp8 else [ToFp16()]
     scale_into = "_enc_w_scales" if use_fp8 else None
     ep = f"{model_root}.language_model.layers.{{i}}"
     items = [

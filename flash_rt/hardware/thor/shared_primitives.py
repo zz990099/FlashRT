@@ -42,6 +42,7 @@ NOT in scope (live elsewhere):
 """
 
 import math
+import os
 import numpy as np
 
 
@@ -223,6 +224,11 @@ def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None)
     hidden = bufs['hidden']
     fg = bufs['fg']               # S*D fp16 scratch for O/Down GEMM output
 
+    # SigLIP FP16 weights stay in [K, N] row-major (cuBLAS NN convention).
+    # Tested 2026-05-18 swapping to CUTLASS NT (cutlass_fp16_wide) after
+    # dropping T() in the spec — bit-exact correctness (cos=1.0) but no
+    # net hot-regime win at Pi0.5 SigLIP shape (84.13 vs 83.87 cublas, in
+    # the ±0.5 ms noise band).  Keep cuBLAS for now.
     for l in range(L):
         # ── Attention LayerNorm → x_norm ──
         fvk.layer_norm_fp16(x, weights['ln_attn_w'][l], weights['ln_attn_b'][l],
@@ -265,7 +271,10 @@ def _siglip_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None)
 
 def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
     """FP16-only Paligemma encoder forward. Mirrors encoder_forward
-    structure with FP8 cast/descale dropped.
+    structure with FP8 cast/descale dropped. GEMMs use the CUTLASS-FP16
+    NT path (weights stored ``[N, K]`` row-major, matching the FP8 NT
+    convention) rather than cuBLASLt; FP8-equivalent shape-specific
+    tactics (sq/t1/wide) are chosen per-GEMM.
     """
     Se = dims['Se']; D = dims['D']; H = dims['H']
     NH = dims['NH']; HD = dims['HD']; L = dims['L']
@@ -284,22 +293,46 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
     fg = bufs['fg']
     ones = bufs['ones']
 
+    # Kernel-dispatch env switches, read once per call so graph capture sees
+    # a fixed path. SKIP_LAST_QKV is kept off by default: setting it to 1 was
+    # tested 2026-05-18 and showed inconsistent (sometimes reversed) timing,
+    # suggesting it also affects downstream output via the decoder's K/V cache.
+    skip_last_qkv = os.environ.get("SKIP_LAST_QKV", "0") == "1"
+    qkv_kernel = os.environ.get("QKV_KERNEL", "k64")
+    use_rms_qkv_bundle = os.environ.get("USE_RMS_QKV_BUNDLE", "1") == "1"
+    enc_path = os.environ.get("ENC_PATH", "head")
+    use_ffn_block = os.environ.get("USE_FFN_BLOCK", "0") == "1"
+    o_kernel = os.environ.get("O_KERNEL", "plain")
+    g8_kernel = os.environ.get("G8_KERNEL", "bundled")
+
     for l in range(L):
         last = (l == L - 1)
 
-        # 1. RMSNorm (noweight via ones buf)
-        fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
+        if not last or not skip_last_qkv:
+            # 1+2. RMSNorm + QKV (k64) — env-switchable bundle.
+            _qkv = qkv_kernel
+            if use_rms_qkv_bundle and _qkv == "k64":
+                fvk.flashrt_rms_qkv_fp16(
+                    x, ones, x_norm,
+                    weights['qkv_w'][l], qkv,
+                    Se, D, 2560, 1e-6, stream)
+            else:
+                fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
+                if   _qkv == "sq":    fvk.cutlass_fp16_sq   (x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, 1.0, 0.0, stream)
+                elif _qkv == "wide":  fvk.cutlass_fp16_wide (x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, 1.0, 0.0, stream)
+                elif _qkv == "t1":    fvk.cutlass_fp16_t1   (x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, 1.0, 0.0, stream)
+                elif _qkv == "plain": fvk.cutlass_fp16_plain(x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, 1.0, 0.0, stream)
+                else:                 fvk.cutlass_fp16_k64  (x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, 1.0, 0.0, stream)
 
-        # 2. QKV GEMM
-        gemm.fp16_nn(x_norm, weights['qkv_w'][l], qkv, Se, 2560, D, stream)
-
-        # 3+4. Split+RoPE+KV
-        kv_elem_off = l * total_keys * HD
-        fvk.qkv_split_rope_kvcache_fp16(
-            qkv, weights['rope'], attn_out,
-            weights['Kc'], weights['Vc'],
-            Se, Q_dim, K_dim, HD, 2560,
-            kv_elem_off, HD, stream)
+            # 3+4. Split+RoPE+KV
+            kv_elem_off = l * total_keys * HD
+            fvk.qkv_split_rope_kvcache_fp16(
+                qkv, weights['rope'], attn_out,
+                weights['Kc'], weights['Vc'],
+                Se, Q_dim, K_dim, HD, 2560,
+                kv_elem_off, HD, stream)
+        else:
+            kv_elem_off = l * total_keys * HD  # unused but kept for code-flow parity
 
         if not last:
             # 5. Attention
@@ -312,24 +345,81 @@ def _encoder_forward_fp16(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None
                                         logits, attn_out,
                                         Se, Se, NH, HD, attn_scale, stream)
 
-            # 6. O proj
-            gemm.fp16_nn(attn_out, weights['o_w'][l], fg, Se, D, D, stream)
-
-            # 7. Residual + RMSNorm
-            fvk.residual_add_fp16(x, fg, Se * D, stream)
-            fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
-
-            # 8. Gate+Up GEMM
-            gemm.fp16_nn(x_norm, weights['gate_w'][l], gate, Se, H * 2, D, stream)
-
-            # 9. GELU(gate) × up
-            fvk.gate_geglu_merged_fp16(gate, hidden, Se, H, stream)
-
-            # 10. Down GEMM
-            gemm.fp16_nn(hidden, weights['down_w'][l], fg, Se, D, H, stream)
-
-            # 11. Residual (next layer's RMSNorm done at top of next iter)
-            fvk.residual_add_fp16(x, fg, Se * D, stream)
+            # Env-switch ENC_PATH: "pre_mk1" runs the unfused split GEMMs +
+            # separate residual_add (the pre-megakernel baseline).  Default
+            # "head" fuses the O-proj residual and runs rms + the GeGLU
+            # megakernel + down GEMM with the residual folded in.
+            up_w_ptr = weights['gate_w'][l] + H * D * 2
+            if enc_path == "pre_mk1":
+                # 6. O proj (no resid fuse)
+                fvk.cutlass_fp16_k64(attn_out, weights['o_w'][l], fg,
+                                      Se, D, D, 1.0, 0.0, stream)
+                # 7. resid + rmsnorm
+                fvk.residual_add_fp16(x, fg, Se * D, stream)
+                fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
+                # 8. sq_gelu(x_norm @ W_gate) → gate
+                fvk.cutlass_fp16_sq_gelu(x_norm, weights['gate_w'][l],
+                                          gate, Se, H, D, 1.0, 0.0, stream)
+                # 9. sq(x_norm @ W_up) → bufs['hidden'] as up scratch
+                fvk.cutlass_fp16_sq(x_norm, up_w_ptr, hidden,
+                                     Se, H, D, 1.0, 0.0, stream)
+                # mul: gate * hidden → hidden (use hidden as in-place mul out)
+                fvk.mul_fp16(gate, hidden, hidden, Se * H, stream)
+                # 10. 2sm21 G8 (no resid fuse)
+                fvk.cutlass_fp16_2sm21(hidden, weights['down_w'][l], fg,
+                                        Se, D, H, 1.0, 0.0, stream)
+                # 11. resid add
+                fvk.residual_add_fp16(x, fg, Se * D, stream)
+            else:
+                # head: O resid fuse + (rms + mega + G8 resid fuse).
+                # plain won 2026-05-18 sweep at FP16 Pi0.5 O shape
+                # (Se=768 N=K=D=2048): -0.5 ms hot regime vs k64.
+                #
+                # USE_FFN_BLOCK=1: bundle rms+mega+G8 in one C entry
+                # (flashrt_encoder_ffn_block_fp16).  Default 0 = current
+                # head with rms separate and mega+G8 bundled.
+                _ffn_bundle = use_ffn_block
+                _o = o_kernel
+                if _o == "sq":
+                    fvk.cutlass_fp16_sq   (attn_out, weights['o_w'][l], x, Se, D, D, 1.0, 1.0, stream)
+                elif _o == "wide":
+                    fvk.cutlass_fp16_wide (attn_out, weights['o_w'][l], x, Se, D, D, 1.0, 1.0, stream)
+                elif _o == "t1":
+                    fvk.cutlass_fp16_t1   (attn_out, weights['o_w'][l], x, Se, D, D, 1.0, 1.0, stream)
+                elif _o == "plain":
+                    fvk.cutlass_fp16_plain(attn_out, weights['o_w'][l], x, Se, D, D, 1.0, 1.0, stream)
+                else:
+                    fvk.cutlass_fp16_k64  (attn_out, weights['o_w'][l], x, Se, D, D, 1.0, 1.0, stream)
+                if _ffn_bundle:
+                    fvk.flashrt_encoder_ffn_block_fp16(
+                        x, ones, x_norm,
+                        weights['gate_w'][l], up_w_ptr, weights['down_w'][l],
+                        gate, hidden,
+                        Se, H, D, 1e-6, stream)
+                    continue
+                fvk.rms_norm_fp16(x, ones, x_norm, Se, D, 1e-6, stream)
+                # Bundled GeGLU megakernel + down GEMM (2sm21 beta=1) in one C
+                # entry.  The bundle wins ~0.5 ms in the hot regime over the
+                # same two launches issued separately.  G8 kernel via env (bundled
+                # entry always uses 2sm21 internally; G8_KERNEL switches
+                # to unbundled python path with a different kernel).
+                _g8 = g8_kernel
+                if _g8 == "bundled":
+                    fvk.flashrt_megakernel_geglu_g8_fp16(
+                        x_norm, weights['gate_w'][l], up_w_ptr,
+                        weights['down_w'][l],
+                        hidden, x,
+                        Se, H, D, stream)
+                else:
+                    fvk.flashrt_megakernel_geglu_fp16(
+                        x_norm, weights['gate_w'][l], up_w_ptr,
+                        gate, hidden, Se, H, D, stream)
+                    if   _g8 == "sq":    fvk.cutlass_fp16_sq   (hidden, weights['down_w'][l], x, Se, D, H, 1.0, 1.0, stream)
+                    elif _g8 == "wide":  fvk.cutlass_fp16_wide (hidden, weights['down_w'][l], x, Se, D, H, 1.0, 1.0, stream)
+                    elif _g8 == "k64":   fvk.cutlass_fp16_k64  (hidden, weights['down_w'][l], x, Se, D, H, 1.0, 1.0, stream)
+                    elif _g8 == "plain": fvk.cutlass_fp16_plain(hidden, weights['down_w'][l], x, Se, D, H, 1.0, 1.0, stream)
+                    elif _g8 == "t1":    fvk.cutlass_fp16_t1   (hidden, weights['down_w'][l], x, Se, D, H, 1.0, 1.0, stream)
+                    else:                fvk.cutlass_fp16_2sm21(hidden, weights['down_w'][l], x, Se, D, H, 1.0, 1.0, stream)
 
 
 def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None,

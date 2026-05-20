@@ -276,6 +276,52 @@ extern "C" float launch_w4a8_gemm(void*, void*, void*, void*, void*, void*, int,
 extern "C" int cutlass_fp8_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+// CUTLASS FP16 variants (encoder/SigLIP FP16 path)
+extern "C" int cutlass_fp16_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sq(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_t1(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_wide(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_k64(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_2sm21(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_k64_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sq_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_k64_mul_aux(void*, void*, void*, void*, int, int, int, cudaStream_t);
+#ifdef FLASHRT_HAVE_SM100_ENCODER_MLP
+extern "C" int encoder_mlp_fused_fp16(void*, void*, void*, void*,
+                                       void*, void*, void*, void*,
+                                       int, int, int, int, cudaStream_t);
+#endif
+extern "C" int flashrt_megakernel_single_fp16(void*, void*, void*,
+                                               int, int, int,
+                                               float, float, cudaStream_t);
+extern "C" int flashrt_megakernel_geglu_fp16(void*, void*, void*,
+                                              void*, void*,
+                                              int, int, int,
+                                              cudaStream_t);
+// Fused encoder GeGLU + down-proj with residual.
+// Args: (X, W_gate, W_up, W_down, hidden_scratch, x_inout, M, H, D, stream).
+// Computes x_inout += GeGLU(X @ W_gate, X @ W_up) @ W_down, bundling the
+// GeGLU megakernel and the down GEMM (beta=1) into one C entry.
+extern "C" int flashrt_megakernel_geglu_g8_fp16(void*, void*, void*,
+                                                 void*,
+                                                 void*, void*,
+                                                 int, int, int,
+                                                 cudaStream_t);
+
+// Bundle: rms_norm + GeGLU + down-proj + residual into one C entry.
+extern "C" int flashrt_encoder_ffn_block_fp16(void*, void*, void*,
+                                               void*, void*, void*,
+                                               void*, void*,
+                                               int, int, int, float,
+                                               cudaStream_t);
+
+// Bundle: rms_norm + QKV (k64) into one C entry.
+extern "C" int flashrt_rms_qkv_fp16(void*, void*, void*, void*, void*,
+                                     int, int, int, float, cudaStream_t);
+#ifdef FLASHRT_HAVE_SM100_SWEEP
+extern "C" int cutlass_fp16_sweep(int variant, void*, void*, void*, int, int, int, float, float, cudaStream_t);
+extern "C" int cutlass_fp16_sweep_count();
+#endif
 extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_gelu(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 extern "C" int cutlass_fp8_sq_f32out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
@@ -1099,6 +1145,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                    reinterpret_cast<__half*>(out), seq, half_dim, to_stream(stream));
     }, py::arg("merged"), py::arg("out"), py::arg("seq"), py::arg("half_dim"), py::arg("stream") = 0);
 
+    m.def("mul_fp16", [](uintptr_t a, uintptr_t b, uintptr_t out,
+                         int n, uintptr_t stream) {
+        mul_fp16(reinterpret_cast<const __half*>(a),
+                 reinterpret_cast<const __half*>(b),
+                 reinterpret_cast<__half*>(out), n, to_stream(stream));
+    }, py::arg("a"), py::arg("b"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+
     // Merged GEGLU (tanh-approx GELU) → FP8 (FP16 input, matches pi05 FFN quant path)
     m.def("gate_geglu_merged_fp8_fp16", [](uintptr_t merged, uintptr_t out,
                                             int seq, int half_dim,
@@ -1378,6 +1431,186 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("A"), py::arg("B"), py::arg("D"),
        py::arg("M"), py::arg("N"), py::arg("K"),
        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    // ── CUTLASS FP16 GEMMs (FP16 path, NT layout — B is [N,K] row-major) ──
+    m.def("cutlass_fp16_plain", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                     int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_plain(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_sq", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_sq(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_t1", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_t1(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_wide", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_wide(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_k64", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                  int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_k64(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_2sm21", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_2sm21(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_k64_gelu", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                       int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_k64_gelu(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_sq_gelu", [](uintptr_t A, uintptr_t B, uintptr_t D,
+                                      int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_sq_gelu(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+
+    m.def("cutlass_fp16_k64_mul_aux", [](uintptr_t A, uintptr_t B, uintptr_t Aux, uintptr_t D,
+                                          int M, int N, int K, uintptr_t stream) {
+        return cutlass_fp16_k64_mul_aux(to_ptr(A), to_ptr(B), to_ptr(Aux), to_ptr(D),
+                                         M, N, K, to_stream(stream));
+    }, py::arg("A"), py::arg("B"), py::arg("Aux"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    // Path C foundation: vendored production sm100_gemm_tma_warpspecialized
+    // kernel struct, single GEMM.  Must match cutlass_fp16_sq isolation
+    // perf before extending to multi-mainloop megakernel.
+    m.def("flashrt_megakernel_single_fp16",
+          [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+             float alpha, float beta, uintptr_t stream) {
+              return flashrt_megakernel_single_fp16(
+                  to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                  alpha, beta, to_stream(stream));
+          },
+          py::arg("A"), py::arg("B"), py::arg("D"),
+          py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+          py::arg("stream") = 0);
+
+    // GeGLU megakernel: one launch computes hidden = GELU(X @ W_gate) * (X @ W_up).
+    // The two sub-GEMMs share one tcgen05.alloc; each CTA work tile runs the
+    // gate GEMM then the up GEMM in series via a single AccumulatorPipeline.
+    m.def("flashrt_megakernel_geglu_fp16",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
+             uintptr_t D_gate_scratch, uintptr_t hidden,
+             int M, int N, int K, uintptr_t stream) {
+              return flashrt_megakernel_geglu_fp16(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up),
+                  to_ptr(D_gate_scratch), to_ptr(hidden),
+                  M, N, K, to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"),
+          py::arg("D_gate_scratch"), py::arg("hidden"),
+          py::arg("M"), py::arg("N"), py::arg("K"),
+          py::arg("stream") = 0);
+
+    // Fused GeGLU + down-proj with residual: the GeGLU megakernel and the
+    // down GEMM (beta=1) are bundled inside one .cu entry (two launches).
+    m.def("flashrt_megakernel_geglu_g8_fp16",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up,
+             uintptr_t W_down,
+             uintptr_t hidden_scratch, uintptr_t x_inout,
+             int M, int H, int D, uintptr_t stream) {
+              return flashrt_megakernel_geglu_g8_fp16(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up),
+                  to_ptr(W_down),
+                  to_ptr(hidden_scratch), to_ptr(x_inout),
+                  M, H, D, to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"),
+          py::arg("W_down"),
+          py::arg("hidden_scratch"), py::arg("x_inout"),
+          py::arg("M"), py::arg("H"), py::arg("D"),
+          py::arg("stream") = 0);
+
+    // Bundle: rms_norm + QKV (k64) in one C entry.
+    m.def("flashrt_rms_qkv_fp16",
+          [](uintptr_t x, uintptr_t rms_weight, uintptr_t x_norm,
+             uintptr_t qkv_weight, uintptr_t qkv_out,
+             int M, int D, int N_qkv, float rms_eps, uintptr_t stream) {
+              return flashrt_rms_qkv_fp16(
+                  to_ptr(x), to_ptr(rms_weight), to_ptr(x_norm),
+                  to_ptr(qkv_weight), to_ptr(qkv_out),
+                  M, D, N_qkv, rms_eps, to_stream(stream));
+          },
+          py::arg("x"), py::arg("rms_weight"), py::arg("x_norm"),
+          py::arg("qkv_weight"), py::arg("qkv_out"),
+          py::arg("M"), py::arg("D"), py::arg("N_qkv"),
+          py::arg("rms_eps") = 1e-6f, py::arg("stream") = 0);
+
+    // Bundled FFN block: rms_norm + GeGLU megakernel + down-proj + residual
+    // in one C entry.
+    m.def("flashrt_encoder_ffn_block_fp16",
+          [](uintptr_t x_resid, uintptr_t rms_weight, uintptr_t x_norm,
+             uintptr_t W_gate, uintptr_t W_up, uintptr_t W_down,
+             uintptr_t gate_scratch, uintptr_t hidden_scratch,
+             int M, int H, int D, float rms_eps, uintptr_t stream) {
+              return flashrt_encoder_ffn_block_fp16(
+                  to_ptr(x_resid), to_ptr(rms_weight), to_ptr(x_norm),
+                  to_ptr(W_gate), to_ptr(W_up), to_ptr(W_down),
+                  to_ptr(gate_scratch), to_ptr(hidden_scratch),
+                  M, H, D, rms_eps, to_stream(stream));
+          },
+          py::arg("x_resid"), py::arg("rms_weight"), py::arg("x_norm"),
+          py::arg("W_gate"), py::arg("W_up"), py::arg("W_down"),
+          py::arg("gate_scratch"), py::arg("hidden_scratch"),
+          py::arg("M"), py::arg("H"), py::arg("D"),
+          py::arg("rms_eps") = 1e-6f, py::arg("stream") = 0);
+
+#ifdef FLASHRT_HAVE_SM100_ENCODER_MLP
+    // Path C encoder MLP megakernel scaffold (WIP, off by default; built only
+    // with -DFLASHRT_BUILD_SM100_ENCODER_MLP=ON).
+    m.def("encoder_mlp_fused_fp16",
+          [](uintptr_t X, uintptr_t W_gate, uintptr_t W_up, uintptr_t W_down,
+             uintptr_t gate_buf, uintptr_t up_buf, uintptr_t hid_buf, uintptr_t out,
+             int M, int N_out, int K, int H, uintptr_t stream) {
+              return encoder_mlp_fused_fp16(
+                  to_ptr(X), to_ptr(W_gate), to_ptr(W_up), to_ptr(W_down),
+                  to_ptr(gate_buf), to_ptr(up_buf), to_ptr(hid_buf), to_ptr(out),
+                  M, N_out, K, H, to_stream(stream));
+          },
+          py::arg("X"), py::arg("W_gate"), py::arg("W_up"), py::arg("W_down"),
+          py::arg("gate_buf"), py::arg("up_buf"), py::arg("hid_buf"), py::arg("out"),
+          py::arg("M"), py::arg("N_out"), py::arg("K"), py::arg("H"),
+          py::arg("stream") = 0);
+#endif
+
+#ifdef FLASHRT_HAVE_SM100_SWEEP
+    // FP16 tile-sweep bench dispatch (off by default; built only with
+    // -DFLASHRT_BUILD_SM100_SWEEP=ON).
+    m.def("cutlass_fp16_sweep", [](int variant, uintptr_t A, uintptr_t B, uintptr_t D,
+                                    int M, int N, int K, float alpha, float beta, uintptr_t stream) {
+        return cutlass_fp16_sweep(variant, to_ptr(A), to_ptr(B), to_ptr(D),
+                                  M, N, K, alpha, beta, to_stream(stream));
+    }, py::arg("variant"), py::arg("A"), py::arg("B"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f, py::arg("stream") = 0);
+    m.def("cutlass_fp16_sweep_count", []() { return cutlass_fp16_sweep_count(); });
+#endif
 
     // FP32 output variants — for models with activations exceeding FP16 range
     m.def("cutlass_fp8_sq_f32out", [](uintptr_t A, uintptr_t B, uintptr_t D,
